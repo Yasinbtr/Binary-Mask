@@ -1,0 +1,131 @@
+import pathlib
+from torch.nn import Conv2d
+import torch
+import cv2
+import numpy as np
+import matplotlib.pyplot as plt
+import torch.nn.functional as F
+
+# Sabitler
+CONFIDENCE_THRESHOLD = 0.01
+INPUT_SIZE = (416, 416)
+OVERLAY_ALPHA = 0.6
+BOX_COLOR = (0, 0, 0)
+TEXT_COLOR = (255, 255, 255)
+BOX_THICKNESS = 2
+TEXT_SCALE = 0.5
+TEXT_THICKNESS = 2
+
+# Model yükle
+model = torch.hub.load('/content/drive/MyDrive/deneme/yolov5', 'custom', path='/content/drive/MyDrive/deneme/best.pt', source='local')
+model.eval()
+
+# Conv2D katmanını bul
+def find_last_conv_layer(model):
+    for layer in reversed(list(model.modules())):
+        if isinstance(layer, Conv2d):
+            return layer
+    raise ValueError("Modelde Conv2D katmanı bulunamadı!")
+
+target_layer = find_last_conv_layer(model.model)
+
+# Score-CAM sınıfı
+class ScoreCAM:
+    def __init__(self, model, target_layer):
+        self.model = model
+        self.target_layer = target_layer
+        self.activations = None
+        self.hook()
+
+    def hook(self):
+        def forward_hook(module, input, output):
+            self.activations = output.detach()
+        self.target_layer.register_forward_hook(forward_hook)
+
+    def generate(self, input_tensor, box_idx=0):
+        with torch.no_grad():
+            output = self.model(input_tensor)
+
+        predictions = self.decode_predictions(output)
+        if not predictions:
+            raise ValueError("Tahmin yok!")
+
+        predictions = sorted(predictions, key=lambda x: x['confidence'], reverse=True)
+        target_box = predictions[box_idx]
+        print(f"Kullanılan kutu: {target_box}")
+
+        activations = self.activations  # shape: [B, C, H, W]
+        b, k, u, v = activations.size()
+        score_cams = []
+
+        for i in range(k):
+            act = activations[:, i, :, :].unsqueeze(1)
+            act_upsampled = F.interpolate(act, size=input_tensor.shape[2:], mode='bilinear', align_corners=False)
+            normed = (act_upsampled - act_upsampled.min()) / (act_upsampled.max() - act_upsampled.min() + 1e-5)
+            masked_input = input_tensor * normed
+            with torch.no_grad():
+                masked_output = self.model(masked_input)
+            conf = masked_output[0, box_idx, 0].item()  # güven skoru
+            score_cams.append(conf * activations[0, i, :, :].cpu().numpy())
+
+        cam = np.sum(score_cams, axis=0)
+        cam = np.maximum(cam, 0)
+        cam = (cam - cam.min()) / (cam.max() - cam.min() + 1e-9)
+        return cam, predictions
+
+    def generate_heatmap(self, img_rgb, cam):
+        heatmap = cv2.resize(cam, (img_rgb.shape[1], img_rgb.shape[0]))
+        heatmap = np.uint8(255 * heatmap)
+        heatmap_colored = cv2.applyColorMap(heatmap, cv2.COLORMAP_TURBO)
+        heatmap_colored = cv2.cvtColor(heatmap_colored, cv2.COLOR_BGR2RGB)
+        return heatmap_colored
+
+    @staticmethod
+    def decode_predictions(output):
+        predictions = []
+        for i in range(output.shape[1]):
+            box = output[0, i, :4].detach().cpu().numpy()
+            confidence_tensor = output[0, i, 4]
+            confidence = float(confidence_tensor.detach().cpu().numpy())
+            if confidence > CONFIDENCE_THRESHOLD:
+                predictions.append({
+                    'box': box,
+                    'confidence': confidence,
+                    'confidence_tensor': confidence_tensor
+                })
+        return predictions
+
+# Görüntü işleme fonksiyonu
+def process_image(img_path, model, score_cam):
+    img = cv2.imread(img_path)
+    if img is None:
+        print("Görüntü okunamadı.")
+        return
+
+    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    img_resized = cv2.resize(img_rgb, INPUT_SIZE)
+    img_tensor = torch.from_numpy(img_resized).permute(2, 0, 1).float().unsqueeze(0) / 255.0
+
+    try:
+        cam_result, predictions = score_cam.generate(img_tensor)
+        heatmap_colored = score_cam.generate_heatmap(img_rgb, cam_result)
+        overlay = cv2.addWeighted(img_rgb, 1 - OVERLAY_ALPHA, heatmap_colored, OVERLAY_ALPHA, 0)
+
+        output_path = "scorecam_result.jpg"
+        cv2.imwrite(output_path, cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
+        print(f"Score-CAM sonucu {output_path} dosyasına kaydedildi.")
+
+        plt.figure(figsize=(12, 8))
+        plt.imshow(overlay)
+        plt.title("Score-CAM Isı Haritası")
+        plt.axis('off')
+        plt.tight_layout()
+        plt.show()
+
+    except Exception as e:
+        print(f"Hata: {e}")
+
+# Ana kod
+if __name__ == "__main__":
+    score_cam = ScoreCAM(model.model, target_layer)
+    process_image('img_path', model, score_cam)
